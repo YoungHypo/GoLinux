@@ -75,19 +75,6 @@ func (jm *JobManager) CancelJob(jobID string) error {
 	return nil
 }
 
-// ListJobs lists all Jobs with optional status filter
-func (jm *JobManager) ListJobs(status job.Status) []*job.Job {
-	var result []*job.Job
-
-	for _, j := range jm.jobs {
-		if status == "" || j.Status == status {
-			result = append(result, j)
-		}
-	}
-
-	return result
-}
-
 // executeJob executes a Job
 func (jm *JobManager) executeJob(j *job.Job) {
 	jm.worker.ExecuteJob(j)
