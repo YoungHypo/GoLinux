@@ -17,15 +17,15 @@ make build
 ### Commands
 
 1. Execute command:
-   ```bash
-   ./golinux run <command>
+```bash
+./golinux run <command>
    
-   # Examples
-   ./golinux run ls -la
-   ./golinux run echo "Hello, World!"
-   ```
+# Examples
+./golinux run ls -la
+./golinux run echo "Hello, World!"
+```
 
 2. Get help:
-   ```bash
-   ./golinux help
-   ```
+```bash
+./golinux help
+```

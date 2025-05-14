@@ -11,21 +11,33 @@ import (
 	"GoLinux/pkg/job"
 )
 
+// StateChangeCallback defines the type of state change callback function
+type StateChangeCallback func(j *job.Job, status job.Status, message string, exitCode int, pid int)
+
 // Worker responsible for executing Linux commands
 type Worker struct {
-	id string
+	id            string
+	onStateChange StateChangeCallback
 }
 
 // NewWorker creates a new Worker
 func NewWorker(id string) *Worker {
 	return &Worker{
-		id: id,
+		id:            id,
+		onStateChange: nil,
 	}
+}
+
+func (w *Worker) SetStateChangeCallback(callback StateChangeCallback) {
+	w.onStateChange = callback
 }
 
 // ExecuteJob synchronously executes a job
 func (w *Worker) ExecuteJob(j *job.Job) {
-	j.SetRunning()
+	// notify state change to running
+	if w.onStateChange != nil {
+		w.onStateChange(j, job.StatusRunning, "", 0, -1)
+	}
 
 	// Create a context that can be canceled
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(j.Timeout)*time.Second)
@@ -34,7 +46,10 @@ func (w *Worker) ExecuteJob(j *job.Job) {
 	// Prepare command
 	cmdParts := strings.Fields(j.Command)
 	if len(cmdParts) == 0 {
-		j.SetFailed("Empty command", 1)
+		// notify empty command error
+		if w.onStateChange != nil {
+			w.onStateChange(j, job.StatusFailed, "Empty command", 1, -1)
+		}
 		return
 	}
 
@@ -44,12 +59,29 @@ func (w *Worker) ExecuteJob(j *job.Job) {
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
-	// Execute command
-	err := cmd.Run()
+	// Start command (instead of Run)
+	if err := cmd.Start(); err != nil {
+		// notify start failed
+		if w.onStateChange != nil {
+			w.onStateChange(j, job.StatusFailed, fmt.Sprintf("Failed to start command: %v", err), 1, -1)
+		}
+		return
+	}
+
+	// notify PID
+	if w.onStateChange != nil {
+		w.onStateChange(j, job.StatusRunning, "", 0, cmd.Process.Pid)
+	}
+
+	// Wait for the command to complete
+	err := cmd.Wait()
 
 	// Handle timeout
 	if ctx.Err() == context.DeadlineExceeded {
-		j.SetFailed(fmt.Sprintf("Command timed out after %d seconds", j.Timeout), -1)
+		// notify timeout
+		if w.onStateChange != nil {
+			w.onStateChange(j, job.StatusFailed, fmt.Sprintf("Command timed out after %d seconds", j.Timeout), -1, -1)
+		}
 		return
 	}
 
@@ -61,10 +93,29 @@ func (w *Worker) ExecuteJob(j *job.Job) {
 		} else {
 			exitCode = 1
 		}
-		j.SetFailed(fmt.Sprintf("Error: %v\nStderr: %s", err, stderr.String()), exitCode)
+
+		// check if the error is due to SIGTERM (process was manually terminated)
+		isSigterm := strings.Contains(err.Error(), "signal: terminated")
+
+		if isSigterm && j.Status == job.StatusCancelled {
+			// if already marked as cancelled, do nothing
+			return
+		} else if isSigterm {
+			// if process was terminated by signal but not marked as cancelled, notify cancelled status
+			if w.onStateChange != nil {
+				w.onStateChange(j, job.StatusCancelled, stderr.String(), exitCode, -1)
+			}
+		} else {
+			// other errors, notify failed status
+			if w.onStateChange != nil {
+				w.onStateChange(j, job.StatusFailed, fmt.Sprintf("Error: %v\nStderr: %s", err, stderr.String()), exitCode, -1)
+			}
+		}
 		return
 	}
 
-	// Set job as completed
-	j.SetCompleted(stdout.String(), 0)
+	// notify completed status
+	if w.onStateChange != nil {
+		w.onStateChange(j, job.StatusCompleted, stdout.String(), 0, -1)
+	}
 }

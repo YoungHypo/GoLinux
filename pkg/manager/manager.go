@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"syscall"
 
 	"GoLinux/pkg/job"
 	"GoLinux/pkg/worker"
@@ -35,6 +36,9 @@ func NewJobManager(maxJobs int) *JobManager {
 		storePath: storePath,
 	}
 
+	// set state change callback
+	jm.worker.SetStateChangeCallback(jm.handleStateChange)
+
 	// Load existing jobs
 	jm.loadJobs()
 
@@ -61,7 +65,8 @@ func (jm *JobManager) CreateJob(command string, timeoutSeconds int) (*job.Job, e
 	// Save job to persistent storage
 	jm.saveJob(j)
 
-	jm.executeJob(j)
+	// Execute job asynchronously
+	go jm.executeJob(j)
 
 	return j, nil
 }
@@ -144,10 +149,11 @@ func (jm *JobManager) CleanJobs() (int, error) {
 
 // executeJob executes a Job
 func (jm *JobManager) executeJob(j *job.Job) {
-	jm.worker.ExecuteJob(j)
-
-	// Save job after execution is complete
+	// save initial state
 	jm.saveJob(j)
+
+	// execute job, all state changes will be handled through callback
+	jm.worker.ExecuteJob(j)
 }
 
 // Save job to file
@@ -199,6 +205,67 @@ func (jm *JobManager) loadJobs() error {
 		if _, exists := jm.jobs[j.ID]; !exists {
 			jm.jobs[j.ID] = j
 		}
+	}
+
+	return nil
+}
+
+func (jm *JobManager) handleStateChange(j *job.Job, status job.Status, message string, exitCode int, pid int) {
+	// update job state based on status
+	switch status {
+	case job.StatusRunning:
+		j.SetRunning()
+		if pid > 0 {
+			j.SetPid(pid)
+		}
+	case job.StatusCompleted:
+		j.SetCompleted(message, exitCode)
+	case job.StatusFailed:
+		j.SetFailed(message, exitCode)
+	case job.StatusCancelled:
+		j.SetCancelled()
+	}
+
+	// save updated job state
+	jm.saveJob(j)
+}
+
+// StopJob stops a running job by its ID
+func (jm *JobManager) StopJob(jobID string) error {
+	// find job in memory
+	j, exists := jm.jobs[jobID]
+	if !exists {
+		// find job in file
+		j, err := jm.loadJobFromFile(jobID)
+		if err != nil {
+			return fmt.Errorf("job with ID %s not found", jobID)
+		}
+		jm.jobs[jobID] = j
+	}
+
+	if !j.IsRunning() {
+		return fmt.Errorf("job with ID %s is not running, current status: %s", jobID, j.Status)
+	}
+
+	if j.Pid <= 0 {
+		return fmt.Errorf("cannot stop job %s: invalid process ID (%d)", jobID, j.Pid)
+	}
+
+	// mark job as cancelled
+	j.SetCancelled()
+	jm.saveJob(j)
+
+	// Send SIGTERM to the process
+	process, err := os.FindProcess(j.Pid)
+	if err != nil {
+		return fmt.Errorf("failed to find process with PID %d: %v", j.Pid, err)
+	}
+
+	if err := process.Signal(syscall.SIGTERM); err != nil {
+		// if failed to send SIGTERM, restore job state
+		j.Status = job.StatusRunning
+		jm.saveJob(j)
+		return fmt.Errorf("failed to send SIGTERM to process with PID %d: %v", j.Pid, err)
 	}
 
 	return nil

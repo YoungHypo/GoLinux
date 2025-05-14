@@ -41,6 +41,13 @@ func main() {
 		listJobs(jm)
 	case "clean":
 		cleanJobs(jm)
+	case "stop":
+		if len(os.Args) < 3 {
+			fmt.Println("Error: missing job ID")
+			printUsage()
+			os.Exit(1)
+		}
+		stopJob(jm, os.Args[2])
 	case "help":
 		printUsage()
 	default:
@@ -56,23 +63,21 @@ func printUsage() {
 	fmt.Println("  status <job-id>       query job status")
 	fmt.Println("  list                  list all jobs")
 	fmt.Println("  clean                 delete all job history")
+	fmt.Println("  stop <job-id>         stop a running job")
 	fmt.Println("  help                  show help information")
 	fmt.Println("\nExamples:")
 	fmt.Println("  ./golinux run ls -la")
 	fmt.Println("  ./golinux status <job-id>")
+	fmt.Println("  ./golinux stop <job-id>")
 }
 
 func runCommand(jm *manager.JobManager, args []string) {
 	command := strings.Join(args, " ")
 
-	fmt.Printf("Executing command: %s\n", command)
-
 	j, err := jm.CreateJob(command, 60) // 60 seconds timeout
 	if err != nil {
 		log.Fatalf("Create job failed: %v", err)
 	}
-
-	fmt.Printf("Job created, ID: %s (saved to disk)\n", j.ID)
 
 	for {
 		j, err = jm.GetJob(j.ID)
@@ -82,15 +87,15 @@ func runCommand(jm *manager.JobManager, args []string) {
 
 		if j.IsComplete() {
 			if j.Status == job.StatusCompleted {
-				fmt.Printf("Output result:\n%s\n", j.Result)
+				fmt.Printf("%s", j.Result)
+			} else if j.Status == job.StatusCancelled {
+				fmt.Printf("Job was cancelled by user\n")
 			} else {
 				fmt.Printf("Error message: %s\n", j.ErrorMsg)
-				fmt.Printf("Exit code: %d\n", j.ExitCode)
 			}
 			break
 		}
 
-		fmt.Printf(".")
 		time.Sleep(500 * time.Millisecond)
 	}
 }
@@ -101,23 +106,26 @@ func getJobStatus(jm *manager.JobManager, jobID string) {
 		log.Fatalf("Get job failed: %v", err)
 	}
 
-	fmt.Printf("Job ID: %s\n", j.ID)
-	fmt.Printf("Command: %s\n", j.Command)
-	fmt.Printf("Status: %s\n", j.Status)
-	fmt.Printf("Created at: %s\n", j.CreatedAt.Format("2006-01-02 15:04:05"))
+	fmt.Printf("Job ID      : %s\n", j.ID)
+	fmt.Printf("Command     : %s\n", j.Command)
+	fmt.Printf("Status      : %s\n", j.Status)
+	fmt.Printf("Created at  : %s\n", j.CreatedAt.Format("2006-01-02 15:04:05"))
 
 	if j.Status == job.StatusRunning {
-		fmt.Printf("Running for: %s\n", j.Duration())
+		fmt.Printf("Running for : %s\n", j.Duration())
 	} else if j.IsComplete() {
 		fmt.Printf("Completed at: %s\n", j.CompletedAt.Format("2006-01-02 15:04:05"))
-		fmt.Printf("Duration: %s\n", j.Duration())
+		fmt.Printf("Duration    : %s\n", j.Duration())
 	}
 
 	if j.Status == job.StatusCompleted {
-		fmt.Printf("Output result:\n%s\n", j.Result)
+		fmt.Printf("Output      : %s\n", j.Result)
 	} else if j.Status == job.StatusFailed {
-		fmt.Printf("Error message: %s\n", j.ErrorMsg)
-		fmt.Printf("Exit code: %d\n", j.ExitCode)
+		fmt.Printf("Error       : %s\n", j.ErrorMsg)
+		fmt.Printf("Exit code   : %d\n", j.ExitCode)
+	} else if j.Status == job.StatusCancelled {
+		fmt.Printf("Notice      : Job was cancelled by user\n")
+		fmt.Printf("Process ID  : %d (terminated)\n", j.Pid)
 	}
 }
 
@@ -158,4 +166,15 @@ func cleanJobs(jm *manager.JobManager) {
 
 	fmt.Printf("Successfully deleted %d job files\n", count)
 	fmt.Println("All job history has been cleared")
+}
+
+func stopJob(jm *manager.JobManager, jobID string) {
+	err := jm.StopJob(jobID)
+	if err != nil {
+		log.Fatalf("Failed to stop job: %v", err)
+	}
+
+	fmt.Printf("Job %s stopped successfully\n", jobID)
+	// Display the current status after stopping
+	getJobStatus(jm, jobID)
 }

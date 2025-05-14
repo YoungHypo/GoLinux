@@ -17,16 +17,17 @@ const (
 )
 
 type Job struct {
-	ID          string
-	Command     string
-	Status      Status
-	Result      string
-	ErrorMsg    string
-	CreatedAt   time.Time
-	StartedAt   time.Time
-	CompletedAt time.Time
-	ExitCode    int
-	Timeout     int
+	ID          string    `json:"id"`
+	Command     string    `json:"command"`
+	Status      Status    `json:"status"`
+	Result      string    `json:"result"`
+	ErrorMsg    string    `json:"error_message"`
+	CreatedAt   time.Time `json:"created_at"`
+	StartedAt   time.Time `json:"started_at"`
+	CompletedAt time.Time `json:"completed_at"`
+	ExitCode    int       `json:"exit_code"`
+	Timeout     int       `json:"timeout"`
+	Pid         int       `json:"pid"`
 }
 
 // NewJob creates a new job
@@ -37,6 +38,7 @@ func NewJob(command string, timeout int) *Job {
 		Status:    StatusPending,
 		CreatedAt: time.Now(),
 		Timeout:   timeout,
+		Pid:       -1, // Initialize with invalid PID
 	}
 }
 
@@ -44,6 +46,10 @@ func NewJob(command string, timeout int) *Job {
 func (j *Job) SetRunning() {
 	j.Status = StatusRunning
 	j.StartedAt = time.Now()
+}
+
+func (j *Job) SetPid(pid int) {
+	j.Pid = pid
 }
 
 // SetCompleted sets job status to completed
@@ -71,6 +77,11 @@ func (j *Job) SetCancelled() {
 // IsComplete checks if the job is complete (regardless of success or failure)
 func (j *Job) IsComplete() bool {
 	return j.Status == StatusCompleted || j.Status == StatusFailed || j.Status == StatusCancelled
+}
+
+// IsRunning checks if the job is currently running
+func (j *Job) IsRunning() bool {
+	return j.Status == StatusRunning
 }
 
 // Duration returns the job execution duration
