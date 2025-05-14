@@ -30,6 +30,17 @@ func main() {
 			os.Exit(1)
 		}
 		runCommand(jm, os.Args[2:])
+	case "status":
+		if len(os.Args) < 3 {
+			fmt.Println("Error: missing job ID")
+			printUsage()
+			os.Exit(1)
+		}
+		getJobStatus(jm, os.Args[2])
+	case "list":
+		listJobs(jm)
+	case "clean":
+		cleanJobs(jm)
 	case "help":
 		printUsage()
 	default:
@@ -42,19 +53,26 @@ func main() {
 func printUsage() {
 	fmt.Println("Linux command execution tool usage:")
 	fmt.Println("  run <command>         execute command")
+	fmt.Println("  status <job-id>       query job status")
+	fmt.Println("  list                  list all jobs")
+	fmt.Println("  clean                 delete all job history")
 	fmt.Println("  help                  show help information")
 	fmt.Println("\nExamples:")
 	fmt.Println("  ./golinux run ls -la")
-	fmt.Println("  ./golinux run echo \"Hello, World!\"")
+	fmt.Println("  ./golinux status <job-id>")
 }
 
 func runCommand(jm *manager.JobManager, args []string) {
 	command := strings.Join(args, " ")
 
+	fmt.Printf("Executing command: %s\n", command)
+
 	j, err := jm.CreateJob(command, 60) // 60 seconds timeout
 	if err != nil {
 		log.Fatalf("Create job failed: %v", err)
 	}
+
+	fmt.Printf("Job created, ID: %s (saved to disk)\n", j.ID)
 
 	for {
 		j, err = jm.GetJob(j.ID)
@@ -64,9 +82,10 @@ func runCommand(jm *manager.JobManager, args []string) {
 
 		if j.IsComplete() {
 			if j.Status == job.StatusCompleted {
-				fmt.Printf("%s", j.Result)
+				fmt.Printf("Output result:\n%s\n", j.Result)
 			} else {
-				fmt.Printf("%s", j.ErrorMsg)
+				fmt.Printf("Error message: %s\n", j.ErrorMsg)
+				fmt.Printf("Exit code: %d\n", j.ExitCode)
 			}
 			break
 		}
@@ -74,4 +93,69 @@ func runCommand(jm *manager.JobManager, args []string) {
 		fmt.Printf(".")
 		time.Sleep(500 * time.Millisecond)
 	}
+}
+
+func getJobStatus(jm *manager.JobManager, jobID string) {
+	j, err := jm.GetJob(jobID)
+	if err != nil {
+		log.Fatalf("Get job failed: %v", err)
+	}
+
+	fmt.Printf("Job ID: %s\n", j.ID)
+	fmt.Printf("Command: %s\n", j.Command)
+	fmt.Printf("Status: %s\n", j.Status)
+	fmt.Printf("Created at: %s\n", j.CreatedAt.Format("2006-01-02 15:04:05"))
+
+	if j.Status == job.StatusRunning {
+		fmt.Printf("Running for: %s\n", j.Duration())
+	} else if j.IsComplete() {
+		fmt.Printf("Completed at: %s\n", j.CompletedAt.Format("2006-01-02 15:04:05"))
+		fmt.Printf("Duration: %s\n", j.Duration())
+	}
+
+	if j.Status == job.StatusCompleted {
+		fmt.Printf("Output result:\n%s\n", j.Result)
+	} else if j.Status == job.StatusFailed {
+		fmt.Printf("Error message: %s\n", j.ErrorMsg)
+		fmt.Printf("Exit code: %d\n", j.ExitCode)
+	}
+}
+
+func listJobs(jm *manager.JobManager) {
+	jobs := jm.ListJobs("")
+
+	fmt.Printf("Total %d jobs:\n", len(jobs))
+
+	if len(jobs) == 0 {
+		fmt.Println("No job records")
+		return
+	}
+
+	fmt.Println("ID                                   Command                Status     Created At")
+	fmt.Println("--------------------------------------------------------------------------------")
+
+	for _, j := range jobs {
+		cmdShort := j.Command
+		if len(cmdShort) > 20 {
+			cmdShort = cmdShort[:17] + "..."
+		}
+
+		fmt.Printf("%-36s %-20s %-10s %s\n",
+			j.ID,
+			cmdShort,
+			j.Status,
+			j.CreatedAt.Format("2006-01-02 15:04:05"))
+	}
+}
+
+func cleanJobs(jm *manager.JobManager) {
+	fmt.Println("Cleaning all job history...")
+
+	count, err := jm.CleanJobs()
+	if err != nil {
+		log.Fatalf("Failed to clean jobs: %v", err)
+	}
+
+	fmt.Printf("Successfully deleted %d job files\n", count)
+	fmt.Println("All job history has been cleared")
 }
