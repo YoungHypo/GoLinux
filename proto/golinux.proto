@@ -1,0 +1,101 @@
+syntax = "proto3";
+package golinux;
+
+option go_package = "./proto";
+
+service JobService {
+  rpc CreateJob(CreateJobRequest) returns (CreateJobResponse);
+
+  rpc GetJobStatus(GetJobStatusRequest) returns (JobStatusResponse);
+
+  rpc StopJob(StopJobRequest) returns (StopJobResponse);
+
+  rpc ListJobs(ListJobsRequest) returns (ListJobsResponse);
+
+  rpc CleanJobs(CleanJobsRequest) returns (CleanJobsResponse);
+
+  rpc StreamJobStatus(GetJobStatusRequest) returns (stream JobStatusResponse);
+}
+
+enum JobStatus {
+  PENDING = 0;
+  RUNNING = 1;
+  COMPLETED = 2;
+  FAILED = 3;
+  CANCELLED = 4;
+}
+
+message Job {
+  string id = 1;
+  string command = 2;
+  JobStatus status = 3;
+  string result = 4;
+  string error_message = 5;
+  string created_at = 6;
+  string started_at = 7;
+  string completed_at = 8;
+  int32 exit_code = 9;
+  int32 timeout = 10;
+  int32 pid = 11;
+  int64 duration_ms = 12;
+}
+
+message CreateJobRequest {
+  string command = 1;
+  int32 timeout = 2;
+}
+
+message CreateJobResponse {
+  string job_id = 1;
+  bool success = 2;
+  string error = 3;
+}
+
+message GetJobStatusRequest {
+  string job_id = 1;
+}
+
+message JobStatusResponse {
+  string job_id = 1;
+  string command = 2;
+  JobStatus status = 3;
+  string result = 4;
+  string error_message = 5;
+  string created_at = 6;
+  string started_at = 7;
+  string completed_at = 8;
+  int32 exit_code = 9;
+  int32 pid = 10;
+  bool is_complete = 11;
+  int64 duration_ms = 12;
+}
+
+message StopJobRequest {
+  string job_id = 1;
+}
+
+message StopJobResponse {
+  bool success = 1;
+  string error = 2;
+}
+
+message ListJobsRequest {
+  string status_filter = 1;
+  int32 limit = 2;
+  int32 offset = 3;
+}
+
+message ListJobsResponse {
+  repeated Job jobs = 1;
+  int32 total_count = 2;
+}
+
+message CleanJobsRequest {
+  bool confirm = 1;
+}
+
+message CleanJobsResponse {
+  int32 deleted_count = 1;
+  bool success = 2;
+  string error = 3;
+}
