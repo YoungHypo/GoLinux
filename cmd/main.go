@@ -13,7 +13,11 @@ import (
 
 // Simple command line tool for executing Linux commands
 func main() {
-	jm := manager.NewJobManager(1000)
+	jm, err := manager.NewJobManager(1000, "jobs.db")
+	if err != nil {
+		log.Fatalf("Failed to initialize job manager: %v", err)
+	}
+	defer jm.Close()
 
 	if len(os.Args) < 2 {
 		printUsage()
@@ -130,7 +134,10 @@ func getJobStatus(jm *manager.JobManager, jobID string) {
 }
 
 func listJobs(jm *manager.JobManager) {
-	jobs := jm.ListJobs("")
+	jobs, err := jm.ListJobs("")
+	if err != nil {
+		log.Fatalf("Failed to list jobs: %v", err)
+	}
 
 	fmt.Printf("Total %d jobs:\n", len(jobs))
 

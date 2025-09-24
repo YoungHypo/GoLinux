@@ -83,7 +83,10 @@ func (s *JobServiceServer) StopJob(ctx context.Context, req *pb.StopJobRequest) 
 }
 
 func (s *JobServiceServer) ListJobs(ctx context.Context, req *pb.ListJobsRequest) (*pb.ListJobsResponse, error) {
-	jobs := s.manager.ListJobs("")
+	jobs, err := s.manager.ListJobs("")
+	if err != nil {
+		return nil, fmt.Errorf("failed to list jobs: %v", err)
+	}
 
 	var pbJobs []*pb.Job
 	for _, j := range jobs {

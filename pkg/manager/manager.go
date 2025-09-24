@@ -1,53 +1,72 @@
 package manager
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"syscall"
 
 	"GoLinux/pkg/job"
+	"GoLinux/pkg/storage"
 	"GoLinux/pkg/worker"
 )
 
 type JobManager struct {
-	jobs      map[string]*job.Job // Stores mapping from job ID to job object
-	worker    *worker.Worker
-	maxJobs   int
-	storePath string // Path to store job files
+	jobs    map[string]*job.Job // In-memory cache for active jobs
+	worker  *worker.Worker
+	maxJobs int
+	storage *storage.SQLiteStorage // SQLite storage backend
 }
 
 // NewJobManager creates a new JobManager
-func NewJobManager(maxJobs int) *JobManager {
+func NewJobManager(maxJobs int, dbPath string) (*JobManager, error) {
 	if maxJobs <= 0 {
 		maxJobs = 1000 // Default value
 	}
 
-	// Create storage directory
-	storePath := "jobs"
-	os.MkdirAll(storePath, 0755)
+	if dbPath == "" {
+		dbPath = "jobs.db" // Default database path
+	}
+
+	// Initialize SQLite storage
+	store, err := storage.NewSQLiteStorage(dbPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize storage: %v", err)
+	}
 
 	jm := &JobManager{
-		jobs:      make(map[string]*job.Job),
-		worker:    worker.NewWorker("worker-1"),
-		maxJobs:   maxJobs,
-		storePath: storePath,
+		jobs:    make(map[string]*job.Job),
+		worker:  worker.NewWorker("worker-1"),
+		maxJobs: maxJobs,
+		storage: store,
 	}
 
 	// set state change callback
 	jm.worker.SetStateChangeCallback(jm.handleStateChange)
 
-	// Load existing jobs
-	jm.loadJobs()
+	// Load active jobs into memory cache
+	if err := jm.loadActiveJobs(); err != nil {
+		store.Close()
+		return nil, fmt.Errorf("failed to load active jobs: %v", err)
+	}
 
-	return jm
+	return jm, nil
+}
+
+// Close closes the JobManager and its storage
+func (jm *JobManager) Close() error {
+	return jm.storage.Close()
 }
 
 // CreateJob creates and runs a new Job
 func (jm *JobManager) CreateJob(command string, timeoutSeconds int) (*job.Job, error) {
-	if len(jm.jobs) >= jm.maxJobs {
+	// Check total job count from database instead of just memory cache
+	totalJobs, err := jm.storage.GetJobCount()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get job count: %v", err)
+	}
+
+	if totalJobs >= jm.maxJobs {
 		return nil, errors.New("maximum number of jobs reached")
 	}
 
@@ -60,10 +79,12 @@ func (jm *JobManager) CreateJob(command string, timeoutSeconds int) (*job.Job, e
 	}
 
 	j := job.NewJob(command, timeoutSeconds)
-	jm.jobs[j.ID] = j
 
-	// Save job to persistent storage
-	jm.saveJob(j)
+	if err := jm.storage.SaveJob(j); err != nil {
+		return nil, fmt.Errorf("failed to save job: %v", err)
+	}
+
+	jm.jobs[j.ID] = j
 
 	// Execute job asynchronously
 	go jm.executeJob(j)
@@ -73,43 +94,40 @@ func (jm *JobManager) CreateJob(command string, timeoutSeconds int) (*job.Job, e
 
 // GetJob retrieves a Job by ID
 func (jm *JobManager) GetJob(jobID string) (*job.Job, error) {
-	j, exists := jm.jobs[jobID]
-	if exists {
+	// Check memory cache first
+	if j, exists := jm.jobs[jobID]; exists {
 		return j, nil
 	}
 
-	// If not in memory, try to load from file
-	j, err := jm.loadJobFromFile(jobID)
+	// If not in memory, load from database
+	j, err := jm.storage.GetJob(jobID)
 	if err != nil {
-		return nil, fmt.Errorf("job with ID %s not found: %v", jobID, err)
+		return nil, err
 	}
 
-	// Add to memory cache
-	jm.jobs[j.ID] = j
+	// Add to memory cache if it's an active job
+	if !j.IsComplete() {
+		jm.jobs[j.ID] = j
+	}
 
 	return j, nil
 }
 
 // ListJobs lists all Jobs with optional status filter
-func (jm *JobManager) ListJobs(status job.Status) []*job.Job {
-	// Load all jobs from storage before listing
-	jm.loadJobs()
-
-	var result []*job.Job
-
-	for _, j := range jm.jobs {
-		if status == "" || j.Status == status {
-			result = append(result, j)
-		}
+func (jm *JobManager) ListJobs(status job.Status) ([]*job.Job, error) {
+	jobs, err := jm.storage.ListJobs(status)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list jobs: %v", err)
 	}
 
-	return result
+	return jobs, nil
 }
 
 func (jm *JobManager) CancelJob(jobID string) error {
-	j, exists := jm.jobs[jobID]
-	if !exists {
-		return fmt.Errorf("job with ID %s not found", jobID)
+	// Try to get job from memory first, then from database
+	j, err := jm.GetJob(jobID)
+	if err != nil {
+		return err
 	}
 
 	if j.IsComplete() {
@@ -117,28 +135,19 @@ func (jm *JobManager) CancelJob(jobID string) error {
 	}
 
 	j.SetCancelled()
+
+	if err := jm.storage.SaveJob(j); err != nil {
+		return fmt.Errorf("failed to save job status: %v", err)
+	}
+
 	return nil
 }
 
-func (jm *JobManager) CleanJobs() (int, error) {
-	// First count the number of jobs to delete
-	entries, err := os.ReadDir(jm.storePath)
+func (jm *JobManager) CleanJobs() (int64, error) {
+	// Delete all jobs from database
+	count, err := jm.storage.DeleteAllJobs()
 	if err != nil {
-		return 0, fmt.Errorf("failed to read jobs directory: %v", err)
-	}
-
-	count := 0
-
-	// Delete all JSON files in the job directory
-	for _, entry := range entries {
-		if filepath.Ext(entry.Name()) == ".json" {
-			filePath := filepath.Join(jm.storePath, entry.Name())
-			if err := os.Remove(filePath); err != nil {
-				fmt.Printf("Warning: failed to delete %s: %v\n", filePath, err)
-				continue
-			}
-			count++
-		}
+		return 0, fmt.Errorf("failed to delete all jobs: %v", err)
 	}
 
 	// Clear the in-memory job cache
@@ -149,62 +158,28 @@ func (jm *JobManager) CleanJobs() (int, error) {
 
 // executeJob executes a Job
 func (jm *JobManager) executeJob(j *job.Job) {
-	// save initial state
-	jm.saveJob(j)
-
 	// execute job, all state changes will be handled through callback
 	jm.worker.ExecuteJob(j)
 }
 
-// Save job to file
-func (jm *JobManager) saveJob(j *job.Job) error {
-	data, err := json.Marshal(j)
+// loadActiveJobs loads running and pending jobs into memory cache
+func (jm *JobManager) loadActiveJobs() error {
+	pendingJobs, err := jm.storage.ListJobs(job.StatusPending)
 	if err != nil {
-		return fmt.Errorf("error marshaling job: %v", err)
+		return fmt.Errorf("failed to load pending jobs: %v", err)
 	}
 
-	filename := filepath.Join(jm.storePath, j.ID+".json")
-	return os.WriteFile(filename, data, 0644)
-}
-
-// Load a single job from file
-func (jm *JobManager) loadJobFromFile(jobID string) (*job.Job, error) {
-	filename := filepath.Join(jm.storePath, jobID+".json")
-	data, err := os.ReadFile(filename)
+	runningJobs, err := jm.storage.ListJobs(job.StatusRunning)
 	if err != nil {
-		return nil, err
+		return fmt.Errorf("failed to load running jobs: %v", err)
 	}
 
-	var j job.Job
-	if err := json.Unmarshal(data, &j); err != nil {
-		return nil, err
+	// Add to memory cache
+	for _, j := range pendingJobs {
+		jm.jobs[j.ID] = j
 	}
-
-	return &j, nil
-}
-
-// Load all jobs from files
-func (jm *JobManager) loadJobs() error {
-	entries, err := os.ReadDir(jm.storePath)
-	if err != nil {
-		return err
-	}
-
-	for _, entry := range entries {
-		if filepath.Ext(entry.Name()) != ".json" {
-			continue
-		}
-
-		jobID := entry.Name()[:len(entry.Name())-5] // Remove .json extension
-		j, err := jm.loadJobFromFile(jobID)
-		if err != nil {
-			continue // Skip files that can't be loaded
-		}
-
-		// Add to memory cache if not already present
-		if _, exists := jm.jobs[j.ID]; !exists {
-			jm.jobs[j.ID] = j
-		}
+	for _, j := range runningJobs {
+		jm.jobs[j.ID] = j
 	}
 
 	return nil
@@ -220,27 +195,27 @@ func (jm *JobManager) handleStateChange(j *job.Job, status job.Status, message s
 		}
 	case job.StatusCompleted:
 		j.SetCompleted(message, exitCode)
+		delete(jm.jobs, j.ID)
 	case job.StatusFailed:
 		j.SetFailed(message, exitCode)
+		delete(jm.jobs, j.ID)
 	case job.StatusCancelled:
 		j.SetCancelled()
+		delete(jm.jobs, j.ID)
 	}
 
-	// save updated job state
-	jm.saveJob(j)
+	// save updated job state to database
+	if err := jm.storage.SaveJob(j); err != nil {
+		fmt.Printf("Warning: failed to save job %s: %v\n", j.ID, err)
+	}
 }
 
 // StopJob stops a running job by its ID
 func (jm *JobManager) StopJob(jobID string) error {
-	// find job in memory
-	j, exists := jm.jobs[jobID]
-	if !exists {
-		// find job in file
-		j, err := jm.loadJobFromFile(jobID)
-		if err != nil {
-			return fmt.Errorf("job with ID %s not found", jobID)
-		}
-		jm.jobs[jobID] = j
+	// Get job from memory or database
+	j, err := jm.GetJob(jobID)
+	if err != nil {
+		return err
 	}
 
 	if !j.IsRunning() {
@@ -253,7 +228,9 @@ func (jm *JobManager) StopJob(jobID string) error {
 
 	// mark job as cancelled
 	j.SetCancelled()
-	jm.saveJob(j)
+	if err := jm.storage.SaveJob(j); err != nil {
+		return fmt.Errorf("failed to save job status: %v", err)
+	}
 
 	// Send SIGTERM to the process
 	process, err := os.FindProcess(j.Pid)
@@ -264,7 +241,9 @@ func (jm *JobManager) StopJob(jobID string) error {
 	if err := process.Signal(syscall.SIGTERM); err != nil {
 		// if failed to send SIGTERM, restore job state
 		j.Status = job.StatusRunning
-		jm.saveJob(j)
+		if saveErr := jm.storage.SaveJob(j); saveErr != nil {
+			fmt.Printf("Warning: failed to restore job status: %v\n", saveErr)
+		}
 		return fmt.Errorf("failed to send SIGTERM to process with PID %d: %v", j.Pid, err)
 	}
 

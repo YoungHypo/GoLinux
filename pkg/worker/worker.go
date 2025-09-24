@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"os/exec"
+	"regexp"
 	"strings"
 	"time"
 
@@ -32,6 +33,36 @@ func (w *Worker) SetStateChangeCallback(callback StateChangeCallback) {
 	w.onStateChange = callback
 }
 
+func (w *Worker) parseCommand(command string) (string, []string, error) {
+	command = strings.TrimSpace(command)
+	if command == "" {
+		return "", nil, fmt.Errorf("empty command")
+	}
+
+	// Handle shell commands like "bash -c", "sh -c", etc.
+	shellPattern := regexp.MustCompile(`^(bash|sh|zsh|fish)\s+-c\s+(.+)$`)
+	if matches := shellPattern.FindStringSubmatch(command); len(matches) == 3 {
+		shell := matches[1]
+		shellCmd := strings.TrimSpace(matches[2])
+
+		// Remove outer quotes if present (but preserve inner content)
+		if (strings.HasPrefix(shellCmd, `"`) && strings.HasSuffix(shellCmd, `"`)) ||
+			(strings.HasPrefix(shellCmd, `'`) && strings.HasSuffix(shellCmd, `'`)) {
+			shellCmd = shellCmd[1 : len(shellCmd)-1]
+		}
+
+		return shell, []string{"-c", shellCmd}, nil
+	}
+
+	// Handle regular commands
+	parts := strings.Fields(command)
+	if len(parts) == 0 {
+		return "", nil, fmt.Errorf("empty command")
+	}
+
+	return parts[0], parts[1:], nil
+}
+
 // ExecuteJob synchronously executes a job
 func (w *Worker) ExecuteJob(j *job.Job) {
 	// notify state change to running
@@ -43,17 +74,16 @@ func (w *Worker) ExecuteJob(j *job.Job) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(j.Timeout)*time.Second)
 	defer cancel()
 
-	// Prepare command
-	cmdParts := strings.Fields(j.Command)
-	if len(cmdParts) == 0 {
-		// notify empty command error
+	cmdName, cmdArgs, err := w.parseCommand(j.Command)
+	if err != nil {
+		// notify command parsing error
 		if w.onStateChange != nil {
-			w.onStateChange(j, job.StatusFailed, "Empty command", 1, -1)
+			w.onStateChange(j, job.StatusFailed, fmt.Sprintf("Command parsing error: %v", err), 1, -1)
 		}
 		return
 	}
 
-	cmd := exec.CommandContext(ctx, cmdParts[0], cmdParts[1:]...)
+	cmd := exec.CommandContext(ctx, cmdName, cmdArgs...)
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -74,7 +104,7 @@ func (w *Worker) ExecuteJob(j *job.Job) {
 	}
 
 	// Wait for the command to complete
-	err := cmd.Wait()
+	err = cmd.Wait()
 
 	// Handle timeout
 	if ctx.Err() == context.DeadlineExceeded {
