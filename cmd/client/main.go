@@ -37,7 +37,7 @@ func main() {
 	defer conn.Close()
 
 	client := pb.NewJobServiceClient(conn)
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
 	command := flag.Args()[0]
@@ -119,28 +119,51 @@ func runCommand(ctx context.Context, client pb.JobServiceClient, args []string, 
 
 	fmt.Printf("Job created: %s\n", resp.JobId)
 
-	// Poll for completion
+	// Stream job status updates
+	stream, err := client.StreamJobStatus(ctx, &pb.GetJobStatusRequest{
+		JobId: resp.JobId,
+	})
+	if err != nil {
+		log.Fatalf("Failed to stream job status: %v", err)
+	}
+
+	var lastResult string
+	var lastStatus pb.JobStatus
+
 	for {
-		statusResp, err := client.GetJobStatus(ctx, &pb.GetJobStatusRequest{
-			JobId: resp.JobId,
-		})
+		statusResp, err := stream.Recv()
 		if err != nil {
-			log.Fatalf("Failed to get job status: %v", err)
+			if err.Error() == "EOF" {
+				break
+			}
+			log.Fatalf("Failed to receive status: %v", err)
 		}
 
+		// Print incremental output
+		if statusResp.Status == pb.JobStatus_RUNNING || statusResp.Status == pb.JobStatus_COMPLETED {
+			// Only print new output since last update
+			if len(statusResp.Result) > len(lastResult) {
+				newOutput := statusResp.Result[len(lastResult):]
+				fmt.Print(newOutput)
+				lastResult = statusResp.Result
+			}
+		}
+
+		// Handle final status
 		if statusResp.IsComplete {
 			switch statusResp.Status {
-			case pb.JobStatus_COMPLETED:
-				fmt.Printf("%s", statusResp.Result)
 			case pb.JobStatus_CANCELLED:
-				fmt.Printf("Job was cancelled by user\n")
+				if lastStatus != pb.JobStatus_CANCELLED {
+					fmt.Printf("\nJob was cancelled by user\n")
+				}
 			case pb.JobStatus_FAILED:
-				fmt.Printf("Error message: %s\n", statusResp.ErrorMessage)
+				if lastStatus != pb.JobStatus_FAILED {
+					fmt.Printf("\nError message: %s\n", statusResp.ErrorMessage)
+				}
 			}
 			break
 		}
-
-		time.Sleep(500 * time.Millisecond)
+		lastStatus = statusResp.Status
 	}
 }
 

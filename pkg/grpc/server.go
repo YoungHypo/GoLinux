@@ -3,6 +3,7 @@ package grpc
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"GoLinux/pkg/job"
@@ -122,13 +123,13 @@ func (s *JobServiceServer) CleanJobs(ctx context.Context, req *pb.CleanJobsReque
 	}, nil
 }
 
-// StreamJobStatus streams job status updates
+// StreamJobStatus streams job status updates using output channels
 func (s *JobServiceServer) StreamJobStatus(req *pb.GetJobStatusRequest, stream pb.JobService_StreamJobStatusServer) error {
 	if req.JobId == "" {
 		return fmt.Errorf("job ID cannot be empty")
 	}
 
-	// Check if job exists
+	// Check if job exists and send initial status
 	j, err := s.manager.GetJob(req.JobId)
 	if err != nil {
 		return err
@@ -138,31 +139,58 @@ func (s *JobServiceServer) StreamJobStatus(req *pb.GetJobStatusRequest, stream p
 		return err
 	}
 
+	// If job is already complete, no need to stream
 	if j.IsComplete() {
 		return nil
 	}
 
-	// Poll for status updates every 500ms
-	ticker := time.NewTicker(500 * time.Millisecond)
-	defer ticker.Stop()
+	// Get the output channel for real-time streaming
+	outputChan := s.manager.GetOutputChannel(req.JobId)
+	if outputChan == nil {
+		// No output channel available, job may be from previous server session
+		return fmt.Errorf("streaming not available for this job")
+	}
 
+	var outputBuffer strings.Builder
+
+	// Stream output in real-time from channel
 	for {
 		select {
 		case <-stream.Context().Done():
 			return stream.Context().Err()
-		case <-ticker.C:
-			j, err := s.manager.GetJob(req.JobId)
-			if err != nil {
-				return err
-			}
 
-			if err := stream.Send(s.jobToResponse(j)); err != nil {
-				return err
-			}
-
-			// Stop streaming if job is complete
-			if j.IsComplete() {
+		case outputLine, ok := <-outputChan:
+			if !ok {
+				// Channel closed, job completed
+				// Send final status
+				finalJob, err := s.manager.GetJob(req.JobId)
+				if err == nil {
+					stream.Send(s.jobToResponse(finalJob))
+				}
 				return nil
+			}
+
+			// Accumulate output
+			outputBuffer.WriteString(outputLine.Content)
+
+			// Create response with incremental output
+			response := &pb.JobStatusResponse{
+				JobId:      req.JobId,
+				Command:    j.Command,
+				Status:     pb.JobStatus_RUNNING,
+				Result:     outputBuffer.String(),
+				CreatedAt:  j.CreatedAt.Format(time.RFC3339),
+				StartedAt:  j.StartedAt.Format(time.RFC3339),
+				IsComplete: false,
+			}
+
+			// Add stderr indicator if needed
+			if outputLine.IsStderr {
+				response.ErrorMessage = outputLine.Content
+			}
+
+			if err := stream.Send(response); err != nil {
+				return err
 			}
 		}
 	}

@@ -1,26 +1,30 @@
 # GoLinux
 
-GoLinux is a Linux command execution tool written in Go that supports both local CLI and remote gRPC execution. It allows users to execute Linux commands and manage job lifecycle with persistence and real-time monitoring.
+GoLinux is a Linux command execution tool written in Go that supports both local CLI and remote gRPC execution. It allows users to execute Linux commands and manage job lifecycle with SQLite persistence and real-time monitoring.
 
 ## Architecture
 
 The project consists of several main components:
 
 1. **Job** - Defines the data structure and state management for command execution tasks
-2. **Worker** - Responsible for executing Linux commands with state callbacks
-3. **JobManager** - Manages job creation, execution, persistence, and lifecycle
-4. **gRPC Server** - Provides remote API for job management
+2. **Worker** - Responsible for executing Linux commands with event-driven architecture
+3. **JobManager** - Manages job creation, execution, persistence, and lifecycle with real-time event processing
+4. **gRPC Server** - Provides remote API for job management with channel-based streaming
 5. **gRPC Client** - Command-line interface for remote job execution
 
 ## Features
 
+- ✅ **Event-Driven Architecture** - Modern channel-based event system for real-time job monitoring
+- ✅ **Real-time Streaming Output** - Live output streaming as commands execute with zero-latency
 - ✅ **Local CLI Execution** - Direct command execution via CLI
-- ✅ **Remote gRPC API** - Execute jobs remotely via gRPC
-- ✅ **Job Persistence** - Jobs stored as JSON files with full state
-- ✅ **Real-time Monitoring** - Stream job status updates
-- ✅ **Process Management** - Start, stop, and monitor processes
+- ✅ **Remote gRPC API** - Execute jobs remotely via gRPC with streaming support
+- ✅ **Smart Command Parsing** - Intelligent parsing for shell commands (bash -c, sh -c, etc.)
+- ✅ **SQLite Persistence** - Jobs stored in SQLite database with full state and indexing
+- ✅ **Process Management** - Start, stop, and monitor processes with PID tracking
+- ✅ **High Performance** - Channel-based communication eliminates callback overhead
 - ✅ **Multi-threading Safe** - Concurrent job execution with proper locking
 - ✅ **Error Handling** - Comprehensive error capture and reporting
+- ✅ **Memory Optimization** - Caching of active jobs only
 
 ## Quick Start
 
@@ -57,6 +61,10 @@ make all
 ./bin/golinux-client stream <job-id>  # Real-time updates
 ./bin/golinux-client stop <job-id>
 ./bin/golinux-client clean
+
+# Real-time streaming output examples
+./bin/golinux-client run bash -c "echo 'Starting...'; sleep 3; echo 'Done!'"
+./bin/golinux-client run "for i in {1..5}; do echo \"Step \$i\"; sleep 1; done"
 ```
 
 ## Building
@@ -64,6 +72,7 @@ make all
 ### Prerequisites
 
 - Go 1.23+
+- SQLite3 (included with go-sqlite3 driver)
 - Protocol Buffers compiler (`protoc`) - for gRPC features
 - Make
 
@@ -90,40 +99,6 @@ make proto      # Generate protobuf code
 make clean
 ```
 
-## Usage Examples
-
-### Local CLI Examples
-
-```bash
-# Simple commands
-./bin/golinux run date
-./bin/golinux run whoami
-./bin/golinux run "ls -la | grep .go"
-
-# Long-running commands
-./bin/golinux run sleep 30
-
-# In another terminal, manage the job
-./bin/golinux list
-./bin/golinux stop <job-id>
-```
-
-### gRPC Client Examples
-
-```bash
-# Remote execution
-./bin/golinux-client -server remote.host:50051 run date
-
-# Custom timeout
-./bin/golinux-client -timeout 120 run "sleep 100"
-
-# Stream real-time status
-./bin/golinux-client stream <job-id>
-
-# Complex shell commands
-./bin/golinux-client run bash -c "echo 'Starting...'; sleep 5; echo 'Done!'"
-```
-
 ## Configuration
 
 ### CLI Options
@@ -134,6 +109,7 @@ make clean
 **golinux-server** (gRPC server):
 - `-port`: Server port (default: 50051)
 - `-max-jobs`: Maximum concurrent jobs (default: 1000)
+- `-db-path`: SQLite database path (default: jobs.db)
 
 **golinux-client** (gRPC client):
 - `-server`: Server address (default: localhost:50051)  
@@ -141,16 +117,24 @@ make clean
 
 ### Job Storage
 
-Jobs are automatically persisted as JSON files in the `jobs/` directory:
+Jobs are automatically persisted in SQLite database with optimized performance:
 
 ```
-jobs/
-├── 550e8400-e29b-41d4-a716-446655440000.json
-├── 6ba7b810-9dad-11d1-80b4-00c04fd430c8.json
-└── ...
+jobs.db                    # SQLite database file
+├── jobs table             # Main job records with indexes
+│   ├── id (PRIMARY KEY)   # Unique job identifier
+│   ├── command            # Command to execute
+│   ├── status             # Job status (indexed)
+│   ├── created_at         # Creation timestamp (indexed)
+│   ├── started_at         # Start timestamp
+│   ├── completed_at       # Completion timestamp
+│   ├── result             # Command output
+│   ├── error_message      # Error information
+│   ├── exit_code          # Process exit code
+│   ├── timeout            # Timeout setting
+│   └── pid                # Process ID
 ```
 
-Each file contains complete job information including command, status, timestamps, results, and error messages.
 
 ## Documentation
 
@@ -169,13 +153,14 @@ GoLinux/
 │   ├── job/               # Job data structures and methods
 │   ├── worker/            # Command execution engine
 │   ├── manager/           # Job lifecycle management
+│   ├── storage/           # Storage layer (SQLite implementation)
 │   └── grpc/              # gRPC server implementation
 ├── proto/                 # Protocol buffer definitions
 │   ├── golinux.proto      # Service definition
 │   ├── golinux.pb.go      # Generated message types
 │   └── golinux_grpc.pb.go # Generated service code
 ├── docs/                  # Documentation
-├── jobs/                  # Job storage (created at runtime)
+├── jobs.db                # SQLite database (created at runtime)
 ├── bin/                   # Compiled binaries
 ├── Makefile               # Build automation
 └── README.md              # This file
@@ -186,10 +171,13 @@ GoLinux/
 ### Adding New Features
 
 1. **Extend the Job struct** in `pkg/job/job.go`
-2. **Update the Worker** in `pkg/worker/worker.go` for execution logic
-3. **Modify JobManager** in `pkg/manager/manager.go` for management features
-4. **Update protobuf** in `proto/golinux.proto` for gRPC API changes
-5. **Regenerate proto code** with `make proto`
+2. **Add new event types** in `pkg/worker/worker.go` if needed
+3. **Update the Worker** in `pkg/worker/worker.go` for execution logic
+4. **Modify JobManager** in `pkg/manager/manager.go` for event handling
+5. **Update Storage interface** in `pkg/storage/interface.go` if needed
+6. **Update SQLite implementation** in `pkg/storage/sqlite.go` for new fields
+7. **Update protobuf** in `proto/golinux.proto` for gRPC API changes
+8. **Regenerate proto code** with `make proto`
 
 ### Testing
 
@@ -200,5 +188,9 @@ make test
 # Test gRPC functionality
 ./bin/golinux-server &
 ./bin/golinux-client run echo "test"
+
+# Test complex shell commands
+./bin/golinux-client run bash -c "for i in {1..3}; do echo \"Test \$i\"; sleep 1; done"
+
 pkill golinux-server
 ```

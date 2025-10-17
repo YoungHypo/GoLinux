@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sync"
 	"syscall"
 
 	"GoLinux/pkg/job"
@@ -12,10 +13,15 @@ import (
 )
 
 type JobManager struct {
-	jobs    map[string]*job.Job // In-memory cache for active jobs
-	worker  *worker.Worker
-	maxJobs int
-	storage *storage.SQLiteStorage // SQLite storage backend
+	jobs        map[string]*job.Job // In-memory cache for active jobs
+	worker      *worker.Worker
+	maxJobs     int
+	storage     *storage.SQLiteStorage            // SQLite storage backend
+	outputChans map[string]chan worker.OutputLine // Output channels for streaming jobs
+	chanMutex   sync.RWMutex                      // Protects outputChans map
+	eventChan   chan worker.JobEvent              // Channel for receiving job events
+	stopChan    chan struct{}                     // Channel to stop event processing
+	wg          sync.WaitGroup                    // WaitGroup for goroutines
 }
 
 // NewJobManager creates a new JobManager
@@ -34,15 +40,24 @@ func NewJobManager(maxJobs int, dbPath string) (*JobManager, error) {
 		return nil, fmt.Errorf("failed to initialize storage: %v", err)
 	}
 
+	eventChan := make(chan worker.JobEvent, 1000) // Buffered channel for events
+
 	jm := &JobManager{
-		jobs:    make(map[string]*job.Job),
-		worker:  worker.NewWorker("worker-1"),
-		maxJobs: maxJobs,
-		storage: store,
+		jobs:        make(map[string]*job.Job),
+		worker:      worker.NewWorker("worker-1"),
+		maxJobs:     maxJobs,
+		storage:     store,
+		outputChans: make(map[string]chan worker.OutputLine),
+		eventChan:   eventChan,
+		stopChan:    make(chan struct{}),
 	}
 
-	// set state change callback
-	jm.worker.SetStateChangeCallback(jm.handleStateChange)
+	// Set up event channel for the worker
+	jm.worker.SetEventChannel(eventChan)
+
+	// Start event processing goroutine
+	jm.wg.Add(1)
+	go jm.processEvents()
 
 	// Load active jobs into memory cache
 	if err := jm.loadActiveJobs(); err != nil {
@@ -55,6 +70,13 @@ func NewJobManager(maxJobs int, dbPath string) (*JobManager, error) {
 
 // Close closes the JobManager and its storage
 func (jm *JobManager) Close() error {
+	// Stop event processing
+	close(jm.stopChan)
+	jm.wg.Wait()
+
+	// Close event channel
+	close(jm.eventChan)
+
 	return jm.storage.Close()
 }
 
@@ -86,8 +108,14 @@ func (jm *JobManager) CreateJob(command string, timeoutSeconds int) (*job.Job, e
 
 	jm.jobs[j.ID] = j
 
-	// Execute job asynchronously
-	go jm.executeJob(j)
+	// Create output channel for streaming
+	outputChan := make(chan worker.OutputLine, 100) // Buffered channel
+	jm.chanMutex.Lock()
+	jm.outputChans[j.ID] = outputChan
+	jm.chanMutex.Unlock()
+
+	// Execute job asynchronously with streaming
+	go jm.ExecuteJob(j, outputChan)
 
 	return j, nil
 }
@@ -156,13 +184,31 @@ func (jm *JobManager) CleanJobs() (int64, error) {
 	return count, nil
 }
 
-// executeJob executes a Job
-func (jm *JobManager) executeJob(j *job.Job) {
-	// execute job, all state changes will be handled through callback
-	jm.worker.ExecuteJob(j)
+// executeJob executes a job with streaming output
+func (jm *JobManager) ExecuteJob(j *job.Job, outputChan chan worker.OutputLine) {
+	defer func() {
+		// Clean up channel when job completes
+		jm.chanMutex.Lock()
+		delete(jm.outputChans, j.ID)
+		jm.chanMutex.Unlock()
+	}()
+
+	// Execute job with channel, all state changes will be handled through callback
+	jm.worker.ExecuteJob(j, outputChan)
 }
 
-// loadActiveJobs loads running and pending jobs into memory cache
+// GetOutputChannel returns the output channel for a job
+func (jm *JobManager) GetOutputChannel(jobID string) <-chan worker.OutputLine {
+	jm.chanMutex.RLock()
+	defer jm.chanMutex.RUnlock()
+
+	if ch, exists := jm.outputChans[jobID]; exists {
+		return ch
+	}
+	return nil
+}
+
+// loadActiveJobs cancels old jobs from previous server sessions
 func (jm *JobManager) loadActiveJobs() error {
 	pendingJobs, err := jm.storage.ListJobs(job.StatusPending)
 	if err != nil {
@@ -174,37 +220,81 @@ func (jm *JobManager) loadActiveJobs() error {
 		return fmt.Errorf("failed to load running jobs: %v", err)
 	}
 
-	// Add to memory cache
+	// Cancel all old jobs from previous server sessions
 	for _, j := range pendingJobs {
-		jm.jobs[j.ID] = j
+		j.SetCancelled()
+		if err := jm.storage.SaveJob(j); err != nil {
+			fmt.Printf("Warning: failed to cancel pending job %s: %v\n", j.ID, err)
+		}
 	}
+
 	for _, j := range runningJobs {
-		jm.jobs[j.ID] = j
+		j.SetCancelled()
+		if err := jm.storage.SaveJob(j); err != nil {
+			fmt.Printf("Warning: failed to cancel running job %s: %v\n", j.ID, err)
+		}
 	}
 
 	return nil
 }
 
-func (jm *JobManager) handleStateChange(j *job.Job, status job.Status, message string, exitCode int, pid int) {
-	// update job state based on status
-	switch status {
-	case job.StatusRunning:
-		j.SetRunning()
-		if pid > 0 {
-			j.SetPid(pid)
+// processEvents processes job events from the event channel
+func (jm *JobManager) processEvents() {
+	defer jm.wg.Done()
+
+	for {
+		select {
+		case event := <-jm.eventChan:
+			jm.handleJobEvent(event)
+		case <-jm.stopChan:
+			return
 		}
-	case job.StatusCompleted:
-		j.SetCompleted(message, exitCode)
+	}
+}
+
+// handleJobEvent handles a single job event
+func (jm *JobManager) handleJobEvent(event worker.JobEvent) {
+	j, exists := jm.jobs[event.JobID]
+	if !exists {
+		// Try to load from database
+		var err error
+		j, err = jm.storage.GetJob(event.JobID)
+		if err != nil {
+			fmt.Printf("Warning: job %s not found: %v\n", event.JobID, err)
+			return
+		}
+		// Add to memory cache if it's an active job
+		if !j.IsComplete() {
+			jm.jobs[j.ID] = j
+		}
+	}
+
+	// Handle different event types
+	switch event.Type {
+	case worker.EventJobStarted:
+		if j.Status == job.StatusPending {
+			j.SetRunning()
+		}
+	case worker.EventJobPIDAssigned:
+		if event.PID > 0 {
+			j.SetPid(event.PID)
+		}
+	case worker.EventJobOutput:
+		if event.Message != "" {
+			j.Result = event.Message
+		}
+	case worker.EventJobCompleted:
+		j.SetCompleted(event.Message, event.ExitCode)
 		delete(jm.jobs, j.ID)
-	case job.StatusFailed:
-		j.SetFailed(message, exitCode)
+	case worker.EventJobFailed, worker.EventJobTimeout:
+		j.SetFailed(event.Message, event.ExitCode)
 		delete(jm.jobs, j.ID)
-	case job.StatusCancelled:
+	case worker.EventJobCancelled:
 		j.SetCancelled()
 		delete(jm.jobs, j.ID)
 	}
 
-	// save updated job state to database
+	// Save updated job state to database
 	if err := jm.storage.SaveJob(j); err != nil {
 		fmt.Printf("Warning: failed to save job %s: %v\n", j.ID, err)
 	}
